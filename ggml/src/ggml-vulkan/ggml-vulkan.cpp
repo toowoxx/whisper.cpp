@@ -1,5 +1,10 @@
 #include "ggml-vulkan.h"
 #include <vulkan/vulkan_core.h>
+
+// Notify the Rust/JNI layer that GPU compute is degraded.
+// Defined in whisper-native's Rust lib.rs. Weak-linked so ggml-vulkan
+// works standalone without whisper-native.
+extern "C" void whisper_native_notify_gpu_degraded(void) __attribute__((weak));
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
 #include "ggml-cpu.h"
@@ -2199,14 +2204,20 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     } catch (const vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: compute pipeline creation failed for %s: %s\n",
                       pipeline->name.c_str(), e.what());
-        device->pipeline_failures.fetch_add(1, std::memory_order_relaxed);
+        if (device->pipeline_failures.fetch_add(1, std::memory_order_relaxed) == 0 &&
+            whisper_native_notify_gpu_degraded) {
+            whisper_native_notify_gpu_degraded();
+        }
         device->device.destroyShaderModule(pipeline->shader_module);
         pipeline->shader_module = VK_NULL_HANDLE;
         return;
     }
     if (!pipeline->pipeline) {
         GGML_LOG_WARN("ggml_vulkan: compute pipeline is null for %s\n", pipeline->name.c_str());
-        device->pipeline_failures.fetch_add(1, std::memory_order_relaxed);
+        if (device->pipeline_failures.fetch_add(1, std::memory_order_relaxed) == 0 &&
+            whisper_native_notify_gpu_degraded) {
+            whisper_native_notify_gpu_degraded();
+        }
         device->device.destroyShaderModule(pipeline->shader_module);
         pipeline->shader_module = VK_NULL_HANDLE;
         return;
@@ -5260,6 +5271,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
                           (int)vk11_features.storageBuffer16BitAccess,
                           (int)fp16_storage);
             device->pipeline_failures.store(1, std::memory_order_relaxed);
+            if (whisper_native_notify_gpu_degraded) {
+                whisper_native_notify_gpu_degraded();
+            }
         }
 
         if (fp16_storage) {
@@ -15133,6 +15147,15 @@ static void ggml_backend_vk_device_get_memory(ggml_backend_dev_t device, size_t 
 
 static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_backend_dev_t dev) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    const vk_device& device = ggml_vk_get_device(ctx->device);
+
+    // When the device is degraded (pipeline compilation failures),
+    // return host buffer type so tensors are allocated in CPU memory.
+    // Returning nullptr would crash whisper_kv_cache_init.
+    if (device->pipeline_failures.load(std::memory_order_relaxed) > 0) {
+        return ggml_backend_vk_host_buffer_type();
+    }
+
     return ggml_backend_vk_buffer_type(ctx->device);
 }
 
