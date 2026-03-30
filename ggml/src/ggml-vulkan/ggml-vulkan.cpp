@@ -6528,6 +6528,15 @@ template <typename T, uint32_t N> const T *push_constant_data(const std::array<T
     return t.data();
 }
 
+// Helper: signal GPU degradation once and skip the dispatch.
+static inline void ggml_vk_flag_dispatch_failure(ggml_backend_vk_context* ctx, const char* reason) {
+    GGML_LOG_WARN("ggml_vulkan: dispatch precondition failed (%s), flagging GPU degraded\n", reason);
+    if (ctx->device->pipeline_failures.fetch_add(1, std::memory_order_relaxed) == 0 &&
+        whisper_native_notify_gpu_degraded) {
+        whisper_native_notify_gpu_degraded();
+    }
+}
+
 template <typename T>
 static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& subctx, vk_pipeline& pipeline, std::initializer_list<vk::DescriptorBufferInfo> const& descriptor_buffer_infos, const T &push_constants, std::array<uint32_t, 3> elements) {
     if (!pipeline || !pipeline->compiled) {
@@ -6541,13 +6550,28 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
         std::cerr << "(" << buffer.buffer << ", " << buffer.offset << ", " << buffer.range << "), ";
     }
     std::cerr << "}, (" << wg0 << "," << wg1 << "," << wg2 << "))");
-    GGML_ASSERT(wg0 <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
-                wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
-                wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
-    GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
-    GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
-    GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
-    GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
+    if (!(wg0 <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
+          wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
+          wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2])) {
+        ggml_vk_flag_dispatch_failure(ctx, "workgroup count exceeds device limits");
+        return;
+    }
+    if (!(ctx->descriptor_set_idx < ctx->descriptor_sets.size())) {
+        ggml_vk_flag_dispatch_failure(ctx, "descriptor set index out of range");
+        return;
+    }
+    if (!(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT)) {
+        ggml_vk_flag_dispatch_failure(ctx, "too many descriptor buffer infos");
+        return;
+    }
+    if (!(pipeline->parameter_count == descriptor_buffer_infos.size())) {
+        ggml_vk_flag_dispatch_failure(ctx, "parameter count mismatch");
+        return;
+    }
+    if (!(pipeline->push_constant_size == push_constant_size(push_constants))) {
+        ggml_vk_flag_dispatch_failure(ctx, "push constant size mismatch");
+        return;
+    }
 
     vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
     vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
@@ -14336,6 +14360,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         vk_instance.pfn_vkQueueBeginDebugUtilsLabelEXT(ctx->device->compute_queue.queue, reinterpret_cast<VkDebugUtilsLabelEXT*>(&dul));
     }
 
+    const uint32_t pipeline_failures_before = ctx->device->pipeline_failures.load(std::memory_order_relaxed);
+
     ctx->prealloc_size_add_rms_partials_offset = 0;
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
@@ -14611,6 +14637,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+
+        if (ctx->device->pipeline_failures.load(std::memory_order_relaxed) > pipeline_failures_before) {
+            GGML_LOG_WARN("ggml_vulkan: dispatch failure detected during graph compute, aborting\n");
+            return GGML_STATUS_FAILED;
+        }
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
