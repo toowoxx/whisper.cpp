@@ -556,6 +556,10 @@ static bool whisper_sched_graph_init(struct whisper_sched & allocr, std::vector<
     auto & meta  = allocr.meta;
 
     sched = ggml_backend_sched_new(backends.data(), nullptr, backends.size(), WHISPER_MAX_NODES, false, true);
+    if (!sched) {
+        WHISPER_LOG_ERROR("%s: failed to create backend scheduler\n", __func__);
+        return false;
+    }
 
     meta.resize(ggml_tensor_overhead()*WHISPER_MAX_NODES + ggml_graph_overhead());
 
