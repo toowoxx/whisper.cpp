@@ -1680,7 +1680,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
-        GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
+        if (!ggml_backend_supports_buft(backends[b], sched->bufts[b])) {
+            GGML_LOG_ERROR("%s: backend %s does not support its default buffer type\n", __func__, ggml_backend_name(backends[b]));
+            ggml_backend_sched_free(sched);
+            return NULL;
+        }
 
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {
